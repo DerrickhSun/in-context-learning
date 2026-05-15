@@ -8,43 +8,29 @@ import warnings
 from sklearn import tree
 import xgboost as xgb
 import math
-from einops import rearrange, reduce
+from einops import reduce
 
 from base_models import NeuralNetwork, ParallelNetworks
+from mlp_seq import MLPSequence
 
-from consts import DEVICE
+from consts import DEVICE, NULL_CHK
 
+def throw(ex):
+    raise ex
 
 def build_model(conf):
-    if conf.family == "gpt2":
-        model = TransformerModel(
-            n_dims=conf.n_dims,
-            n_positions=conf.n_positions,
-            n_embd=conf.n_embd,
-            n_layer=conf.n_layer,
-            n_head=conf.n_head,
-        )
-    elif conf.family == "relu_attn":
-        model = TransformerRelu(
-            n_dims=conf.n_dims,
-            n_positions=conf.n_positions,
-            n_embd=conf.n_embd,
-            n_layer=conf.n_layer,
-            n_head=conf.n_head,
-        )
-    elif conf.family == "nystrom":
-        ## update when done
-        model = TransformerNystrom(
-            n_dims=conf.n_dims,
-            n_positions=conf.n_positions,
-            n_embd=conf.n_embd,
-            n_layer=conf.n_layer,
-            n_head=conf.n_head,
-        )
-    else:
-        raise NotImplementedError
-
-    return model
+    family = conf.family
+    if family == "gpt2":
+        return TransformerModel(**conf)
+    if family == "relu_attn":
+        return TransformerRelu(**conf)
+    if family == "relu_attn_causal":
+        return TransformerReluCausal(**conf)
+    if family == "mlp":
+        return MLPSequence(**conf)
+    if family == "nystrom":
+        return TransformerNystrom(**conf)
+    raise NotImplementedError(f"Invalid model family!: '{family}'")
 
 
 def get_relevant_baselines(task_name):
@@ -98,8 +84,11 @@ def get_relevant_baselines(task_name):
     return models
 
 class TransformerModel(nn.Module):
-    def __init__(self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4):
+    def __init__(self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4, **kwargs):
         super(TransformerModel, self).__init__()
+
+        NULL_CHK(n_dims, n_positions, n_embd, n_layer, n_head)
+
         configuration = GPT2Config(
             n_positions=2 * n_positions,
             n_embd=n_embd,
@@ -167,7 +156,7 @@ def relu_attn(self, query, key, value, attention_mask=None, head_mask=None):
         # Apply the attention mask
         attn_weights = attn_weights + attention_mask
 
-    attn_weights = nn.functional.relu(attn_weights) / query.size(-2)
+    attn_weights = nn.functional.relu(attn_weights) / query.size(-2) 
 
     # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
     attn_weights = attn_weights.type(value.dtype)
@@ -181,103 +170,171 @@ def relu_attn(self, query, key, value, attention_mask=None, head_mask=None):
 
     return attn_output, attn_weights
 
-# used in nystrom_attn
-# iteratively finds the Moore-Penrose inverse
-# work-in-progress
-def pinv(a_s, iters = 7):
+
+# --- Nyström attention (optional `family: nystrom`) --------------------------------
+
+def pinv(a_s, iters=7):
+    """Iterative Moore–Penrose inverse (used when `iterative=True` in nystrom_attn)."""
     abs_x = torch.abs(a_s)
-    col = abs_x.sum(dim = -1)
-    row = abs_x.sum(dim = -2)
-
-    # Need to double check this initialization, doesn't seem to have right size
-    current_z = a_s.transpose(-1, -2) / (torch.max(col) * torch.max(row))
+    col = abs_x.sum(dim=-1)
+    row = abs_x.sum(dim=-2)
+    denom = (torch.max(col) * torch.max(row)).clamp(min=1e-8)
+    current_z = a_s.transpose(-1, -2) / denom
     next_z = pinv_next(a_s, current_z)
-
     for _ in range(iters):
         current_z = next_z
         next_z = pinv_next(a_s, current_z)
     return next_z
 
-# helper function for pinv
+
 def pinv_next(a_s, z):
     dim = a_s.shape[-1]
-    identity = torch.eye(dim)
-    i = (identity.reshape(1,dim,dim)).repeat(a_s.shape[0], a_s.shape[1], 1, 1)
-    inner = 7*i-torch.matmul(a_s,z)
+    identity = torch.eye(dim, device=a_s.device, dtype=a_s.dtype)
+    b, h = a_s.shape[0], a_s.shape[1]
+    i = identity.view(1, 1, dim, dim).expand(b, h, dim, dim)
+    inner = 7 * i - torch.matmul(a_s, z)
     inner = 15 * i - torch.matmul(torch.matmul(a_s, z), inner)
     inner = 13 * i - torch.matmul(torch.matmul(a_s, z), inner)
-    return 1/4*torch.matmul(z, inner)
+    return (1 / 4) * torch.matmul(z, inner)
 
-# needed for landmarking in nystrom, downsamples
+
 def segmented_means(matrix, m):
-    dim3 = matrix.shape[-2] # we downsample the -2 dimension
+    """Landmark pooling along the sequence dimension (dim -2) for Nyström."""
+    dim3 = matrix.shape[-2]
     remainder = dim3 % m
-    if (remainder > 0) :
-        padding = m - (dim3 % m)
-        matrix = nn.functional.pad(matrix, (0,0,padding,0), value = 0)
-    #pooler = nn.AvgPool2d((math.ceil(matrix.shape[-2]/m), 1))
-    #return pooler(matrix)
-    l = math.ceil(dim3/m)
-    landmark_einops_eq = '... (n l) d -> ... n d'
-    return reduce(matrix, landmark_einops_eq, 'sum', l = l)/l
+    if remainder > 0:
+        padding = m - remainder
+        matrix = nn.functional.pad(matrix, (0, 0, padding, 0), value=0)
+    l = math.ceil(dim3 / m)
+    landmark_einops_eq = "... (n l) d -> ... n d"
+    return reduce(matrix, landmark_einops_eq, "sum", l=l) / l
 
 
-# m must be much smaller than dimension, we should probably decide on an m
-def nystrom_attn(self, query, key, value, attention_mask=None, head_mask=None, iterative = False, m = 8):
-    # landmarking
+def nystrom_attn(self, query, key, value, attention_mask=None, head_mask=None, iterative=False, m=8):
     q_bar = segmented_means(query, m)
     k_bar = segmented_means(key, m)
-
-    # this was taken directly from the nystrom paper
-    einops_eq = '... i d, ... j d -> ... i j'
+    einops_eq = "... i d, ... j d -> ... i j"
     sim1 = torch.einsum(einops_eq, query, k_bar)
     sim2 = torch.einsum(einops_eq, q_bar, k_bar)
     sim3 = torch.einsum(einops_eq, q_bar, key)
-
-    # this was also taken from the nystrom paper, but modified
-    attn1, attn2, attn3 = map(lambda t: t.softmax(dim = -1), (sim1, sim2, sim3))
-    attn2_inv = 0
-    if (iterative):
+    attn1, attn2, attn3 = map(lambda t: t.softmax(dim=-1), (sim1, sim2, sim3))
+    if iterative:
         attn2_inv = pinv(attn2)
     else:
         attn2_inv = torch.linalg.pinv(attn2)
     attn_weights = attn1 @ attn2_inv @ attn3
-
-    #attn_weights = attn_weights.type(value.dtype)
-    #attn_weights = self.attn_dropout(attn_weights)
-
-    # uses weights to calculate output
     attn_output = torch.matmul(attn_weights, value)
-    
     return attn_output, attn_weights
 
-class TransformerRelu(TransformerModel):
-    def __init__(self, *args, **kwargs):
-        super(TransformerRelu, self).__init__(*args, **kwargs)
 
-        # Override the attention mechanism with one that replaces softmax with ReLU
+def relu_attn_causal(self, query, key, value, attention_mask=None, head_mask=None):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    if self.scale_attn_weights:
+        attn_weights = attn_weights / (value.size(-1) ** 0.5)
+
+    # Layer-wise attention scaling
+    if self.scale_attn_by_inverse_layer_idx:
+        attn_weights = attn_weights / float(self.layer_idx + 1)
+
+    if not self.is_cross_attention:
+        # if only "normal" attention layer implements causal mask
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
+        attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
+
+    if attention_mask is not None:
+        # Apply the attention mask
+        attn_weights = attn_weights + attention_mask
+
+    # TODO: make this sequence length causal (divide by tokens seen so far, not total tokens in sequence)
+    # relud = nn.functional.relu(attn_weights)
+    seq_len = query.size(-2)
+    causal_seq_len = 1 + ( torch.arange(seq_len, device=DEVICE)
+                                .expand(attn_weights.shape)
+                                .transpose(-1, -2) )
+    # import code
+    # assert attn_weights.shape == causal_seq_len.shape, code.interact(local=locals(), banner=f"Failed shape check: attn_weights do not math causal_seq_len in shape! \n{attn_weights.shape} vs {causal_seq_len.shape}")
+    # pre_attn_weights = attn_weights
+    attn_weights = nn.functional.relu(attn_weights) / (causal_seq_len + 1)
+    # code.interact(local=locals(), banner="yeesh")
+
+    # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = self.attn_dropout(attn_weights)
+
+    # Mask heads if we want to
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output, attn_weights
+
+
+class TransformerCustomAttn(TransformerModel):
+    def __init__(self, *args, new_attn_func=relu_attn, **kwargs):
+        super(TransformerCustomAttn, self).__init__(*args, **kwargs)
+
         attn_layers = list(self._backbone.children())[3]
         attn_module_class = list(attn_layers[0].children())[1].__class__
 
         for i in range(len(attn_layers)):
-            list(attn_layers[i].children())[1]._attn = relu_attn.__get__(
+            list(attn_layers[i].children())[1]._attn = new_attn_func.__get__(
                 list(attn_layers[i].children())[1],
-                attn_module_class
+                attn_module_class,
             )
+
+
+class TransformerRelu(TransformerCustomAttn):
+    def __init__(self, *args, **kwargs):
+        super(TransformerRelu, self).__init__(*args, new_attn_func=relu_attn, **kwargs)
+
+
+class TransformerReluCausal(TransformerCustomAttn):
+    def __init__(self, *args, **kwargs):
+        super(TransformerReluCausal, self).__init__(*args, new_attn_func=relu_attn_causal, **kwargs)
+
 
 class TransformerNystrom(TransformerModel):
-    def __init__(self, *args, **kwargs):
-        super(TransformerNystrom, self).__init__(*args, **kwargs)
+    """GPT-2 stack with Nyström-style approximate attention (replaces softmax attention)."""
 
-        # Override the attention mechanism with one that replaces softmax with Nystrom approximation
+    def __init__(
+        self,
+        n_dims,
+        n_positions,
+        n_embd=128,
+        n_layer=12,
+        n_head=4,
+        nystrom_m=None,
+        nystrom_iterative_pinv=None,
+        **kwargs,
+    ):
+        super().__init__(n_dims, n_positions, n_embd=n_embd, n_layer=n_layer, n_head=n_head, **kwargs)
+        m = 8 if nystrom_m is None else int(nystrom_m)
+        iterative = False if nystrom_iterative_pinv is None else bool(nystrom_iterative_pinv)
+
+        def bound_nystrom(self_attn, query, key, value, attention_mask=None, head_mask=None):
+            return nystrom_attn(
+                self_attn,
+                query,
+                key,
+                value,
+                attention_mask,
+                head_mask,
+                iterative=iterative,
+                m=m,
+            )
+
         attn_layers = list(self._backbone.children())[3]
         attn_module_class = list(attn_layers[0].children())[1].__class__
 
         for i in range(len(attn_layers)):
-            list(attn_layers[i].children())[1]._attn = nystrom_attn.__get__(
-                list(attn_layers[i].children())[1],
-                attn_module_class
-            )
+            attn_mod = list(attn_layers[i].children())[1]
+            attn_mod._attn = bound_nystrom.__get__(attn_mod, attn_module_class)
+
+        self.name = f"gpt2_nystrom_embd={n_embd}_layer={n_layer}_head={n_head}_m={m}"
+
 
 class NNModel:
     def __init__(self, n_neighbors, weights="uniform"):

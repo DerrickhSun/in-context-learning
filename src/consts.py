@@ -1,5 +1,10 @@
 import torch
 
 
-SEQ_MODELS = ["gpt2", "lstm", "relu_attn", "nystrom"]
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEQ_MODELS = ["gpt2", "lstm", "relu_attn", "relu_attn_causal", "mlp", "nystrom"]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def NULL_CHK(*values):
+    for i, val in enumerate(values):
+        if val is None:
+            raise ValueError(f"Encountered `None` value in argument {i+1}!")
