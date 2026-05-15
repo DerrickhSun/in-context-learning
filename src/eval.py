@@ -443,6 +443,8 @@ def conf_to_model_name(conf):
         return "Transformer-ReLU"
     if conf.model.family == "relu_attn_causal":
         return "Transformer-ReLU-causal"
+    if conf.model.family == "nystrom":
+        return "Transformer-Nystrom"
     else:
         print(f"defaulting on: {conf.model.family}")
         return conf.wandb.name

@@ -23,7 +23,10 @@ model_schema = {
     "n_head": merge(tinteger, nullable, default(None)),
     "context_len" : merge(tinteger, nullable, default(None)),
     "hidden_dimensions" : merge(tlist, nullable, default(None)),
-    "activation" : merge(tstring, nullable, default(None))
+    "activation" : merge(tstring, nullable, default(None)),
+    # Nyström attention (`family: nystrom`); optional landmarks / iterative pinv
+    "nystrom_m": merge(tinteger, nullable, default(None)),
+    "nystrom_iterative_pinv": merge(tboolean, nullable, default(None)),
 }
 
 curriculum_base_schema = {

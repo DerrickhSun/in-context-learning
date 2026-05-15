@@ -1,7 +1,7 @@
 import torch
 
 
-SEQ_MODELS = ["gpt2", "lstm", "relu_attn", "relu_attn_causal", "mlp"]
+SEQ_MODELS = ["gpt2", "lstm", "relu_attn", "relu_attn_causal", "mlp", "nystrom"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def NULL_CHK(*values):

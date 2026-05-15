@@ -7,6 +7,8 @@ from sklearn.linear_model import LogisticRegression, Lasso
 import warnings
 from sklearn import tree
 import xgboost as xgb
+import math
+from einops import reduce
 
 from base_models import NeuralNetwork, ParallelNetworks
 from mlp_seq import MLPSequence
@@ -17,21 +19,18 @@ def throw(ex):
     raise ex
 
 def build_model(conf):
-    cls = {
-        "gpt2" : TransformerModel,
-        "relu_attn" : TransformerRelu,
-        "relu_attn_causal" : TransformerReluCausal,
-        "mlp" : MLPSequence,
-    }.get(
-        conf.family,
-        lambda *_, **__: throw(
-            NotImplementedError(f"Invalid model family!: '{conf.family}'")
-        )
-    )
-
-    model = cls(**conf)
-
-    return model
+    family = conf.family
+    if family == "gpt2":
+        return TransformerModel(**conf)
+    if family == "relu_attn":
+        return TransformerRelu(**conf)
+    if family == "relu_attn_causal":
+        return TransformerReluCausal(**conf)
+    if family == "mlp":
+        return MLPSequence(**conf)
+    if family == "nystrom":
+        return TransformerNystrom(**conf)
+    raise NotImplementedError(f"Invalid model family!: '{family}'")
 
 
 def get_relevant_baselines(task_name):
@@ -83,7 +82,6 @@ def get_relevant_baselines(task_name):
 
     models = [model_cls(**kwargs) for model_cls, kwargs in task_to_baselines[task_name]]
     return models
-
 
 class TransformerModel(nn.Module):
     def __init__(self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4, **kwargs):
@@ -172,6 +170,63 @@ def relu_attn(self, query, key, value, attention_mask=None, head_mask=None):
 
     return attn_output, attn_weights
 
+
+# --- Nyström attention (optional `family: nystrom`) --------------------------------
+
+def pinv(a_s, iters=7):
+    """Iterative Moore–Penrose inverse (used when `iterative=True` in nystrom_attn)."""
+    abs_x = torch.abs(a_s)
+    col = abs_x.sum(dim=-1)
+    row = abs_x.sum(dim=-2)
+    denom = (torch.max(col) * torch.max(row)).clamp(min=1e-8)
+    current_z = a_s.transpose(-1, -2) / denom
+    next_z = pinv_next(a_s, current_z)
+    for _ in range(iters):
+        current_z = next_z
+        next_z = pinv_next(a_s, current_z)
+    return next_z
+
+
+def pinv_next(a_s, z):
+    dim = a_s.shape[-1]
+    identity = torch.eye(dim, device=a_s.device, dtype=a_s.dtype)
+    b, h = a_s.shape[0], a_s.shape[1]
+    i = identity.view(1, 1, dim, dim).expand(b, h, dim, dim)
+    inner = 7 * i - torch.matmul(a_s, z)
+    inner = 15 * i - torch.matmul(torch.matmul(a_s, z), inner)
+    inner = 13 * i - torch.matmul(torch.matmul(a_s, z), inner)
+    return (1 / 4) * torch.matmul(z, inner)
+
+
+def segmented_means(matrix, m):
+    """Landmark pooling along the sequence dimension (dim -2) for Nyström."""
+    dim3 = matrix.shape[-2]
+    remainder = dim3 % m
+    if remainder > 0:
+        padding = m - remainder
+        matrix = nn.functional.pad(matrix, (0, 0, padding, 0), value=0)
+    l = math.ceil(dim3 / m)
+    landmark_einops_eq = "... (n l) d -> ... n d"
+    return reduce(matrix, landmark_einops_eq, "sum", l=l) / l
+
+
+def nystrom_attn(self, query, key, value, attention_mask=None, head_mask=None, iterative=False, m=8):
+    q_bar = segmented_means(query, m)
+    k_bar = segmented_means(key, m)
+    einops_eq = "... i d, ... j d -> ... i j"
+    sim1 = torch.einsum(einops_eq, query, k_bar)
+    sim2 = torch.einsum(einops_eq, q_bar, k_bar)
+    sim3 = torch.einsum(einops_eq, q_bar, key)
+    attn1, attn2, attn3 = map(lambda t: t.softmax(dim=-1), (sim1, sim2, sim3))
+    if iterative:
+        attn2_inv = pinv(attn2)
+    else:
+        attn2_inv = torch.linalg.pinv(attn2)
+    attn_weights = attn1 @ attn2_inv @ attn3
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output, attn_weights
+
+
 def relu_attn_causal(self, query, key, value, attention_mask=None, head_mask=None):
     attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
@@ -221,23 +276,65 @@ class TransformerCustomAttn(TransformerModel):
     def __init__(self, *args, new_attn_func=relu_attn, **kwargs):
         super(TransformerCustomAttn, self).__init__(*args, **kwargs)
 
-        # Override the attention mechanism with one that replaces softmax with ReLU
         attn_layers = list(self._backbone.children())[3]
         attn_module_class = list(attn_layers[0].children())[1].__class__
 
         for i in range(len(attn_layers)):
             list(attn_layers[i].children())[1]._attn = new_attn_func.__get__(
                 list(attn_layers[i].children())[1],
-                attn_module_class
+                attn_module_class,
             )
+
 
 class TransformerRelu(TransformerCustomAttn):
     def __init__(self, *args, **kwargs):
         super(TransformerRelu, self).__init__(*args, new_attn_func=relu_attn, **kwargs)
 
+
 class TransformerReluCausal(TransformerCustomAttn):
     def __init__(self, *args, **kwargs):
         super(TransformerReluCausal, self).__init__(*args, new_attn_func=relu_attn_causal, **kwargs)
+
+
+class TransformerNystrom(TransformerModel):
+    """GPT-2 stack with Nyström-style approximate attention (replaces softmax attention)."""
+
+    def __init__(
+        self,
+        n_dims,
+        n_positions,
+        n_embd=128,
+        n_layer=12,
+        n_head=4,
+        nystrom_m=None,
+        nystrom_iterative_pinv=None,
+        **kwargs,
+    ):
+        super().__init__(n_dims, n_positions, n_embd=n_embd, n_layer=n_layer, n_head=n_head, **kwargs)
+        m = 8 if nystrom_m is None else int(nystrom_m)
+        iterative = False if nystrom_iterative_pinv is None else bool(nystrom_iterative_pinv)
+
+        def bound_nystrom(self_attn, query, key, value, attention_mask=None, head_mask=None):
+            return nystrom_attn(
+                self_attn,
+                query,
+                key,
+                value,
+                attention_mask,
+                head_mask,
+                iterative=iterative,
+                m=m,
+            )
+
+        attn_layers = list(self._backbone.children())[3]
+        attn_module_class = list(attn_layers[0].children())[1].__class__
+
+        for i in range(len(attn_layers)):
+            attn_mod = list(attn_layers[i].children())[1]
+            attn_mod._attn = bound_nystrom.__get__(attn_mod, attn_module_class)
+
+        self.name = f"gpt2_nystrom_embd={n_embd}_layer={n_layer}_head={n_head}_m={m}"
+
 
 class NNModel:
     def __init__(self, n_neighbors, weights="uniform"):
